@@ -537,6 +537,7 @@ struct VG93 {
                 status |= 0x02;
         }
 
+        intrq = false; // реальный WD1793/VG93 сбрасывает INTRQ по чтению статуса
         return status;
     }
 
@@ -631,7 +632,7 @@ struct VG93 {
         return sys;
     }
 
-    void WriteCommand(BYTE val, WORD pc, BYTE A, BYTE F, BYTE B, BYTE C, BYTE D, BYTE E, BYTE H, BYTE L) {
+    void WriteCommand(BYTE val, WORD pc) {
         drq = false;
         intrq = false;
 
@@ -1106,7 +1107,7 @@ struct CPUZ80 {
         // --- ВЫСОКОУРОВНЕВЫЙ ПЕРЕХВАТ ЗАПИСИ КОМАНД КОНТРОЛЛЕРА ВГ93 ---
         if (beta_ports_enabled) {   // было: if (trdos_active)
             BYTE low_port = port & 0xFF;
-            if (low_port == 0x1F) { vg93.WriteCommand(val, PC, A, F, B, C, D, E, H, L); return; }
+            if (low_port == 0x1F) { vg93.WriteCommand(val, PC); return; }
             if (low_port == 0x3F) { vg93.WriteTrack(val, PC); return; }
             if (low_port == 0x5F) { vg93.WriteSector(val, PC); return; }
             if (low_port == 0x7F) { vg93.WriteData(val, PC); return; }
@@ -1158,6 +1159,7 @@ struct CPUZ80 {
             ei_delay_counter--;
             if (ei_delay_counter == 0) {
                 IFF1 = true; // enable interrupts after one instruction following EI
+                IFF2 = true;
             }
         }
 
@@ -1441,7 +1443,7 @@ struct CPUZ80 {
 
         case 0x76: { halted = true; return 4; } // HALT
         case 0xFB: { /* EI - enable interrupts after one instruction */ ei_delay_counter = 2; return 4; } // EI (delayed)
-        case 0xF3: { IFF1 = false; return 4; } // DI
+        case 0xF3: { IFF1 = false; IFF2 = false; ei_delay_counter = 0; return 4; } // DI
 
         case 0x08: { BYTE t = A; A = A_alt; A_alt = t; t = F; F = F_alt; F_alt = t; return 4; } // EX AF, AF'
         case 0xD9: { BYTE t; t = B; B = B_alt; B_alt = t; t = C; C = C_alt; C_alt = t; t = D; D = D_alt; D_alt = t; t = E; E = E_alt; E_alt = t; t = H; H = H_alt; H_alt = t; t = L; L = L_alt; L_alt = t; return 4; } // EXX
