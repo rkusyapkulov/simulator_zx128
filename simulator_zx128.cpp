@@ -28,7 +28,6 @@ bool memory_lock_128k = false;   // Блокировка режима 128К (Out
 
 // Состояние TR-DOS (Beta Disk Interface)
 bool trdos_active = false; // Флаг: активно ли сейчас ПЗУ TR-DOS вместо обычного ROM
-bool beta_ports_enabled = false; // порты ВГ93 доступны, пока не был полный сброс/выход из TR-DOS
 
 // Состояние полурядов клавиатуры (8 полурядов по 5 бит, 0 = нажата)
 BYTE spec_key_rows[8] = { 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F }; // effective matrix seen by the Z80
@@ -95,15 +94,13 @@ static const int AUDIO_EVENT_CAPACITY = 16384;
 static AudioEvent audio_events[AUDIO_EVENT_CAPACITY];
 static volatile LONG audio_event_write = 0;
 static volatile LONG audio_event_read = 0;
+static volatile LONG audio_clear_request = 0;
 
 static inline void QueueAudioEvent(BYTE type, BYTE reg, BYTE value) {
     LONG w = audio_event_write;
     LONG r = audio_event_read;
     LONG next = (w + 1) % AUDIO_EVENT_CAPACITY;
-    if (next == r) {
-        // Drop the oldest event rather than blocking the Z80.
-        audio_event_read = (r + 1) % AUDIO_EVENT_CAPACITY;
-    }
+    if (next == r) return;   // очередь полна: теряем новое событие (индекс чтения принадлежит аудиопотоку)
     audio_events[w].tstate = audio_cpu_tstates;
     audio_events[w].type = type;
     audio_events[w].reg = reg;
@@ -208,6 +205,18 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
     while (audio_thread_running) {
         bool didWork = false;
 
+        if (InterlockedExchange(&audio_clear_request, 0)) {
+            has_pending = false;
+            ZeroMemory(r, sizeof(r));
+            beeper = 0;
+            tone_phase[0] = tone_phase[1] = tone_phase[2] = 0.0;
+            noise_phase = 0.0;  noise_lfsr = 1;
+            envelope_phase = 0.0;  envelope_level = 0;  envelope_direction = -1;
+            envelope_hold = true;  envelope_started = false;
+            render_tstate = audio_cpu_tstates;
+            continue;
+        }
+
         for (int i = 0; i < 2; ++i) {
             if (!(waveHeader[i].dwFlags & WHDR_DONE))
                 continue;
@@ -258,7 +267,7 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
 
                 // 1. Генерация Шума
                 int np = r[6] & 0x1F;
-                if (np == 0) np = 32;
+                if (np == 0) np = 1;
                 noise_phase += ay_clock / (16.0 * np * audio_sample_rate);
                 while (noise_phase >= 1.0) {
                     noise_phase -= 1.0;
@@ -270,8 +279,8 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
 
                 // 2. Генерация Огибающей
                 int ep = r[11] | ((int)r[12] << 8);
-                if (ep == 0) ep = 65536;
-                envelope_phase += ay_clock / (256.0 * ep * audio_sample_rate);
+                if (ep == 0) ep = 1;
+                envelope_phase += ay_clock / (16.0 * ep * audio_sample_rate);
                 while (envelope_phase >= 1.0) {
                     envelope_phase -= 1.0;
                     if (!envelope_hold) {
@@ -279,19 +288,13 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
                         if (envelope_level < 0 || envelope_level > 15) {
                             BYTE shape = r[13] & 0x0F;
                             bool cont = (shape & 0x08) != 0;
+                            bool attack = (shape & 0x04) != 0;
                             bool alt = (shape & 0x02) != 0;
                             bool hold = (shape & 0x01) != 0;
-                            if (!cont || hold) {
-                                envelope_level = envelope_direction > 0 ? 15 : 0;
-                                envelope_hold = true;
-                            }
-                            else if (alt) {
-                                envelope_direction = -envelope_direction;
-                                envelope_level = envelope_direction > 0 ? 0 : 15;
-                            }
-                            else {
-                                envelope_level = envelope_direction > 0 ? 0 : 15;
-                            }
+                            if (!cont) { envelope_level = 0; envelope_hold = true; }                 // формы 0..7
+                            else if (hold) { envelope_level = (attack != alt) ? 15 : 0; envelope_hold = true; } // 9, 11, 13, 15
+                            else if (alt) { envelope_direction = -envelope_direction; envelope_level = envelope_direction > 0 ? 0 : 15; }
+                            else { envelope_level = envelope_direction > 0 ? 0 : 15; }
                         }
                     }
                 }
@@ -300,11 +303,12 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
                 double ch_amp[3] = { 0.0, 0.0, 0.0 };
                 for (int ch = 0; ch < 3; ++ch) {
                     int tp = r[ch * 2] | ((r[ch * 2 + 1] & 0x0F) << 8);
-                    if (tp == 0) tp = 4096;
+                    if (tp == 0) tp = 1;
                     tone_phase[ch] += ay_clock / (16.0 * tp * audio_sample_rate);
                     tone_phase[ch] -= floor(tone_phase[ch]);
 
                     double tone = tone_phase[ch] < 0.5 ? 1.0 : -1.0;
+                    if (tp < 6) tone = 1.0;   // выше частоты Найквиста: постоянный уровень вместо алиасинга
                     BYTE mixer = r[7];
                     bool tone_on = (mixer & (1 << ch)) == 0;
                     bool noise_on = (mixer & (1 << (ch + 3))) == 0;
@@ -313,6 +317,7 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
                     if (tone_on && noise_on) sig = tone * noise;
                     else if (tone_on) sig = tone;
                     else if (noise_on) sig = noise;
+                    else sig = 1.0;           // тон и шум выключены: постоянная 1
 
                     BYTE vr = r[8 + ch];
                     double amp = (vr & 0x10)
@@ -387,7 +392,7 @@ void StopAudio() {
         CloseHandle(audio_thread);
         audio_thread = NULL;
     }
-    // drain and unprepare headers and free buffers
+    if (hWaveOut) waveOutReset(hWaveOut);   // вернуть буферы ДО Unprepare и free
     for (int i = 0; i < 2; i++) {
         if (waveHeader[i].lpData) {
             waveOutUnprepareHeader(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
@@ -427,6 +432,7 @@ void ClearAudioBuffers() {
             waveOutWrite(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
         }
     }
+    InterlockedExchange(&audio_clear_request, 1);
 }
 
 struct VG93 {
@@ -446,6 +452,8 @@ struct VG93 {
     bool busy = false;
     bool drq = false;
     bool intrq = false;
+    bool     lost_data = false;   // бит 2 статуса Type II/III
+    uint64_t drq_since = 0;       // когда процессор последний раз обслуживал DRQ (T-states)
 
     enum TransferType {
         TRANSFER_NONE,
@@ -488,10 +496,63 @@ struct VG93 {
         busy = false;
         drq = false;
         intrq = true;
+        lost_data = false;
+        drq_since = 0;
+    }
+
+    void CheckDrqTimeout() {
+        if (!drq || transfer_type == TRANSFER_NONE) return;
+
+        const uint64_t DRQ_TIMEOUT_TSTATES = 50000;   // ~14 мс при 3.5 МГц
+        const uint64_t now = audio_cpu_tstates;
+        if (now < drq_since) { drq_since = now; return; }   // счётчик T-states обнулили
+        if (now - drq_since < DRQ_TIMEOUT_TSTATES) return;
+
+        lost_data = true;
+
+        if (transfer_type == TRANSFER_READ_SECTOR && multi_sector) {
+            ++sector_reg;
+            if (sector_reg > 16 || !LoadCurrentSector()) {
+                EndCommand(true);          // конец цепочки: RNF
+            }
+            else {
+                transfer_pos = 0;
+                transfer_len = 256;
+                drq = true;
+                drq_since = now;
+            }
+        }
+        else {
+            EndCommand(false);   // одиночное чтение, READ ADDRESS, запись (без записи данных), WRITE TRACK
+        }
     }
 
     bool DiskReady() const {
         return trd_is_inserted && !current_trd_data.empty();
+    }
+
+    // 300 об/мин = 200 мс = 700000 T-states; начало оборота совпадает с импульсом INDEX (см. ReadStatus).
+    // Оборот делится на 16 интервалов - по одному на сектор.
+    static const uint64_t DISK_REV_TSTATES = 700000;
+
+    // Для дисков TR-DOS с чередованием 1:2 порядок {1,9,2,10,3,11,4,12,5,13,6,14,7,15,8,16}
+    static BYTE PhysicalSectorId(int slot) {
+        static const BYTE order[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+        return order[slot & 15];
+    }
+    static BYTE NextIdSector() {
+        const uint64_t pos = audio_cpu_tstates % DISK_REV_TSTATES;
+        const int slot = (int)(pos * 16 / DISK_REV_TSTATES);
+        return PhysicalSectorId(slot + 1);
+    }
+    static WORD Crc16Ccitt(const BYTE* p, int n) {      // полином 0x1021, начало 0xFFFF
+        WORD crc = 0xFFFF;
+        for (int i = 0; i < n; ++i) {
+            crc ^= (WORD)p[i] << 8;
+            for (int b = 0; b < 8; ++b)
+                crc = (crc & 0x8000) ? (WORD)((crc << 1) ^ 0x1021) : (WORD)(crc << 1);
+        }
+        return crc;
     }
 
     int Side() const
@@ -505,8 +566,9 @@ struct VG93 {
         return side;
     }
 
-    BYTE ReadStatus(WORD pc)
+    BYTE ReadStatus()
     {
+        CheckDrqTimeout();
         BYTE status = 0;
 
         if (!DiskReady())
@@ -514,6 +576,9 @@ struct VG93 {
 
         if (!last_cmd_type1 && record_not_found)
             status |= 0x10;
+
+        if (!last_cmd_type1 && lost_data)
+            status |= 0x04;   // LOST DATA
 
         if (last_cmd_type1 && track_reg == 0)
             status |= 0x04;
@@ -549,11 +614,11 @@ struct VG93 {
         return status;
     }
 
-    BYTE ReadTrack(WORD pc) {
+    BYTE ReadTrack() {
         return track_reg;
     }
 
-    BYTE ReadSector(WORD pc) {
+    BYTE ReadSector() {
         return sector_reg;
     }
 
@@ -587,10 +652,14 @@ struct VG93 {
         return true;
     }
 
-    BYTE ReadData(WORD pc) {
+    BYTE ReadData() {
         if (transfer_type == TRANSFER_READ_SECTOR || transfer_type == TRANSFER_READ_ADDRESS) {
             if (transfer_pos >= 0 && transfer_pos < transfer_len) {
                 data_reg = sector_buffer[transfer_pos++];
+
+                // DRQ обслужен.
+                drq_since = audio_cpu_tstates;
+
                 drq = (transfer_pos < transfer_len); // Сбрасываем DRQ только если прочитан последний байт
 
                 if (transfer_pos >= transfer_len) {
@@ -627,8 +696,9 @@ struct VG93 {
         return data_reg;
     }
 
-    BYTE ReadSystem(WORD pc)
+    BYTE ReadSystem()
     {
+        CheckDrqTimeout();
         BYTE sys = system_reg & 0x3F;
 
         if (drq)
@@ -640,9 +710,11 @@ struct VG93 {
         return sys;
     }
 
-    void WriteCommand(BYTE val, WORD pc) {
+    void WriteCommand(BYTE val) {
         drq = false;
         intrq = false;
+        lost_data = false;
+        drq_since = audio_cpu_tstates;
 
         // ПЕРЕХВАТ КОМАНДЫ FORCE INTERRUPT (0xD0 - 0xDF) ---
         if ((val & 0xF0) == 0xD0) {
@@ -686,7 +758,7 @@ struct VG93 {
             case 0x20: // STEP
             case 0x30: // STEP + UPDATE
                 if (step_direction_in) {
-                    if (track_reg < 255)
+                    if (track_reg < 79)
                         track_reg++;
                 }
                 else {
@@ -699,7 +771,7 @@ struct VG93 {
 
             case 0x40: // STEP IN
             case 0x50: // STEP IN + UPDATE
-                if (track_reg < 255)
+                if (track_reg < 79)
                     track_reg++;
                 if (val & 0x10)
                     data_reg = track_reg; // UPDATE
@@ -784,19 +856,19 @@ struct VG93 {
             // В TRD первый ID на каждой дорожке — сектор 1.
             const BYTE id_track = track_reg;
             const BYTE id_side = (BYTE)Side();
-            const BYTE id_sector = current_id_sector;
 
+            const BYTE id_sector = NextIdSector();
             sector_buffer[0] = id_track;
             sector_buffer[1] = id_side;
             sector_buffer[2] = id_sector;
-            sector_buffer[3] = 1;   // 256 bytes
-            sector_buffer[4] = 0;   // CRC1
-            sector_buffer[5] = 0;   // CRC2
+            sector_buffer[3] = 1;   // 256 байт
+            const BYTE crc_src[8] = { 0xA1, 0xA1, 0xA1, 0xFE, id_track, id_side, id_sector, 1 };
+            const WORD id_crc = Crc16Ccitt(crc_src, 8);
+            sector_buffer[4] = (BYTE)(id_crc >> 8);
+            sector_buffer[5] = (BYTE)(id_crc & 0xFF);
 
-            // Особенность WD1793/VG93:
-            // после READ ADDRESS track address записывается
-            // в sector register.
-            sector_reg = id_track;
+            // READ ADDRESS только выдаёт ID поля.
+            // Sector Register не должен превращаться в номер дорожки.
 
             transfer_pos = 0;
             transfer_len = 6;
@@ -819,13 +891,16 @@ struct VG93 {
                 return;
             }
 
-            busy = false;       // оставляем твою рабочую модель
-            intrq = true;       // сохраняем старое состояние bit 7
+            // WRITE TRACK действительно выполняется.
+            busy = true;
+            intrq = false;
 
             transfer_type = TRANSFER_WRITE_TRACK;
             transfer_pos = 0;
             transfer_len = WRITE_TRACK_BYTES;
-            drq = true; // готовы принимать первый байт потока трека
+
+            // Контроллер готов принять первый байт.
+            drq = true;
 
             return;
         }
@@ -855,13 +930,13 @@ struct VG93 {
         record_not_found = false;
     }
 
-    void WriteTrack(BYTE val, WORD pc) {
+    void WriteTrack(BYTE val) {
         if (!busy) {
             track_reg = val;
         }
     }
 
-    void WriteSector(BYTE val, WORD pc) {
+    void WriteSector(BYTE val) {
         if (!busy) {
             sector_reg = val;
         }
@@ -880,32 +955,71 @@ struct VG93 {
     // "Логическое" форматирование текущей дорожки/стороны: 16 секторов
     // по 256 нулевых байт. Реального разбора gap/sync/CRC байт WRITE TRACK
     // здесь нет — модель работает с готовым .trd, а не с побитовым треком.
-    bool FormatCurrentTrack() {
+    bool FormatCurrentTrack()
+    {
         if (!DiskReady()) return false;
 
-        for (int s = 1; s <= 16; ++s) {
+        const BYTE saved_sector = sector_reg;
+
+        for (int s = 1; s <= 16; ++s)
+        {
             sector_reg = (BYTE)s;
-            size_t offset = GetTRDOffset();
-            if (offset + 256 > current_trd_data.size()) return false;
-            std::fill(current_trd_data.begin() + offset,
-                current_trd_data.begin() + offset + 256, 0);
+
+            const size_t offset = GetTRDOffset();
+
+            if (offset + 256 > current_trd_data.size())
+            {
+                sector_reg = saved_sector;
+                return false;
+            }
+
+            std::fill(
+                current_trd_data.begin() + offset,
+                current_trd_data.begin() + offset + 256,
+                0
+            );
         }
+
+        // WRITE TRACK не должен случайно менять Sector Register.
+        sector_reg = saved_sector;
+
         return true;
     }
 
-    void WriteData(BYTE val, WORD pc) {
+    bool FinishWriteTrack()
+    {
+        if (!DiskReady())
+            return false;
+
+        return FormatCurrentTrack();
+    }
+
+    void WriteData(BYTE val) {
         data_reg = val;
+        drq_since = audio_cpu_tstates;
 
         if (transfer_type == TRANSFER_WRITE_TRACK) {
-            if (transfer_pos >= 0 && transfer_pos < transfer_len) {
-                ++transfer_pos;
-                if (transfer_pos >= transfer_len) {
-                    bool ok = FormatCurrentTrack();
-                    EndCommand(!ok);
-                }
-                // drq остаётся true всё время передачи — контроллер
-                // готов принять очередной байт потока трека сразу.
+            if (transfer_pos < 0 || transfer_pos >= transfer_len)
+                return;
+
+            // Приняли один байт WRITE TRACK.
+            ++transfer_pos;
+
+            // Пока поток ещё не закончился —
+            // готовы принять следующий байт.
+            if (transfer_pos < transfer_len)
+            {
+                drq = true;
+                return;
             }
+
+            // Все байты WRITE TRACK приняты.
+            drq = false;
+
+            const bool ok = FinishWriteTrack();
+
+            EndCommand(!ok);
+
             return;
         }
 
@@ -952,7 +1066,7 @@ struct VG93 {
         intrq = true;
     }
 
-    void WriteSystem(BYTE val, WORD pc) {
+    void WriteSystem(BYTE val) {
         system_reg = val;
 
         // CLR = 0: сбрасывает только саму микросхему ВГ93 (регистры
@@ -1030,11 +1144,9 @@ struct CPUZ80 {
         // попадает на вектор TR-DOS (0x3D00 - 0x3FFF), находясь при этом в 48К Бэйсике (ROM 1).
         if (PC >= 0x3D00 && PC <= 0x3FFF && current_rom_page == 1 && !trdos_active) {
             trdos_active = true;
-            beta_ports_enabled = true; // включаем доступ к портам и оставляем его включённым
         }
         if (PC >= 0x4000 && trdos_active) {
             trdos_active = false; // страница ПЗУ гасится как обычно
-            // beta_ports_enabled НЕ трогаем - порты остаются живыми для загрузчиков в ОЗУ
         }
 
         // Окно 0: 0x0000 - 0x3FFF (Системное ПЗУ 16 Кб)
@@ -1080,13 +1192,13 @@ struct CPUZ80 {
 
     // Ввод из портов с полноценным сопряжением логики ПЗУ TR-DOS и ВГ93
     inline BYTE InPort(WORD port) {
-        if (beta_ports_enabled) {   // было: if (trdos_active)
+        if (trdos_active) {
             BYTE low_port = port & 0xFF;
-            if (low_port == 0x1F) return vg93.ReadStatus(PC);
-            if (low_port == 0x3F) return vg93.ReadTrack(PC);
-            if (low_port == 0x5F) return vg93.ReadSector(PC);
-            if (low_port == 0x7F) return vg93.ReadData(PC);
-            if (low_port == 0xFF) return vg93.ReadSystem(PC);
+            if (low_port == 0x1F) return vg93.ReadStatus();
+            if (low_port == 0x3F) return vg93.ReadTrack();
+            if (low_port == 0x5F) return vg93.ReadSector();
+            if (low_port == 0x7F) return vg93.ReadData();
+            if (low_port == 0xFF) return vg93.ReadSystem();
         }
 
         // 2. Чтение клавиатуры (стандартный ULA порт 0xFE)
@@ -1108,18 +1220,22 @@ struct CPUZ80 {
             return v;
         }
 
+        // Kempston (A5=0, например порт 0x1F): интерфейса нет - шина читается как 0xFF.
+        // Иначе после отключения портов ВГ93 игры видели бы случайные нажатия джойстика.
+        if ((port & 0x20) == 0) return 0xFF;
+
         return spec_last_floating_bus;
     }
 
     inline void OutPort(WORD port, BYTE val) {
         // --- ВЫСОКОУРОВНЕВЫЙ ПЕРЕХВАТ ЗАПИСИ КОМАНД КОНТРОЛЛЕРА ВГ93 ---
-        if (beta_ports_enabled) {   // было: if (trdos_active)
+        if (trdos_active) {
             BYTE low_port = port & 0xFF;
-            if (low_port == 0x1F) { vg93.WriteCommand(val, PC); return; }
-            if (low_port == 0x3F) { vg93.WriteTrack(val, PC); return; }
-            if (low_port == 0x5F) { vg93.WriteSector(val, PC); return; }
-            if (low_port == 0x7F) { vg93.WriteData(val, PC); return; }
-            if (low_port == 0xFF) { vg93.WriteSystem(val, PC); return; }
+            if (low_port == 0x1F) { vg93.WriteCommand(val); return; }
+            if (low_port == 0x3F) { vg93.WriteTrack(val); return; }
+            if (low_port == 0x5F) { vg93.WriteSector(val); return; }
+            if (low_port == 0x7F) { vg93.WriteData(val); return; }
+            if (low_port == 0xFF) { vg93.WriteSystem(val); return; }
         }
 
         // 1. Переключение страниц памяти 128K (Порт 0x7FFD)
@@ -1155,8 +1271,10 @@ struct CPUZ80 {
 
         // 3. Стандартный системный порт ULA (0xFE)
         if ((port & 0xFF) == 0xFE) {
+            // Bit 4 controls the beeper (speaker)
             spec_speaker_state = (val & 0x10) != 0;
             QueueAudioEvent(AUDIO_EVT_BEEPER, 0, spec_speaker_state ? 1 : 0);
+            // Bits 0..2 set the border color on a real Spectrum
             spec_border_color = val & 0x07;
         }
     }
@@ -1219,6 +1337,48 @@ struct CPUZ80 {
             if (ei_delay_counter == 0) {
                 IFF1 = true; // enable interrupts after one instruction following EI
                 IFF2 = true;
+            }
+        }
+
+        // 1. Проверка маскируемого прерывания (50 Гц)
+        if (int_pending && IFF1) {
+            int_pending = false;
+            halted = false;
+            // Save previous IFF1 in IFF2 so RETN/RETI can restore it, then disable maskable interrupts
+            IFF2 = IFF1;
+            IFF1 = false;
+
+            // Сохраняем текущий адрес возврата в стек
+            WriteByte(--SP, PC >> 8);
+            WriteByte(--SP, PC & 0xFF);
+
+            // Обработка согласно режимам прерываний Z80
+            if (IM == 1) {
+                PC = 0x0038; // Стандартная обработка ZX Spectrum 48K
+                return 13; // IM1: 13 T-states
+            }
+            else if (IM == 0) {
+                // IM0: if an external device supplied a vector byte on the data bus,
+                // the CPU will execute that opcode directly. We emulate a pragmatic
+                // behavior: if interrupt_vector_bus_byte is non-zero and corresponds
+                // to a RST n (0xC7/0xCF/.../0xFF) we jump to its vector; otherwise
+                // fallback to IM1 (0x0038).
+                if (interrupt_vector_bus_byte >= 0xC7 && interrupt_vector_bus_byte <= 0xFF) {
+                    // RST n - compute vector
+                    BYTE rst_index = (interrupt_vector_bus_byte - 0xC7) / 8;
+                    WORD target = (WORD)(rst_index * 8);
+                    PC = target;
+                    return 13; // treat like RST timing
+                }
+                OutputDebugStringA("IM0: no vector byte or unsupported; treating as IM1 (0x0038)\n");
+                PC = 0x0038;
+                return 13;
+            }
+            else if (IM == 2) {
+                WORD vector_addr = (I << 8) | 0xFF;
+                WORD target_pc = ReadByte(vector_addr) | (ReadByte((WORD)(vector_addr + 1)) << 8);
+                PC = target_pc;
+                return 19; // IM2: 19 T-states (vector fetch + indirect)
             }
         }
 
@@ -2170,7 +2330,7 @@ struct CPUZ80 {
 
 CPUZ80 cpu;
 
-// --- ПОПИКСЕЛЬНЫЙ РЕНДЕРИНГ ЭКРАНА ZX SPECTRUM ---
+// --- ПОПИКСЕЛЬНЫЙ РЕНДЕРИНГ ЭКРАНА ZX SPECTRUM С БОРДЮРОМ ---
 void RenderSpectrumScreen(HDC hdc, int xOffset, int yOffset) {
     // ЕДИНЫЙ и 100% правильный массив палитры в формате RGB (под ваш StretchDIBits)
     static const DWORD spec_palette[16] = {
@@ -3427,7 +3587,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (int i = 0; i < 8; i++) std::fill(spec_ram[i], spec_ram[i] + 16384, 0);
             for (int i = 0; i < 8; i++) { spec_key_rows[i] = 0x1F; physical_key_rows[i] = 0x1F; gui_key_rows[i] = 0x1F; }
             for (int i = 0; i < 40; ++i) gui_key_frames[i] = 0;
-            beta_ports_enabled = false;
             spec_flash_frame = 0;
             spec_flash_state = false;
             UpdateRegisterDisplay();
@@ -3461,6 +3620,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // --- WINMAIN С ПОДДЕРЖКОЙ СИНХРОНИЗАЦИИ ---
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+    InitializeCriticalSection(&audio_cs);
+    audio_cs_initialized = true;
+    ay.Reset();
+
     // Подготовка чистого дампа ПЗУ 48К (базовая инициализация по умолчанию)
     memset(spec_rom, 0x00, sizeof(spec_rom));
 
@@ -3527,10 +3690,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     double internal_debt = 0.0;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&last_time);
-
-    InitializeCriticalSection(&audio_cs);
-    audio_cs_initialized = true;
-    ay.Reset();
 
     while (emulator_running) {
         MsgWaitForMultipleObjectsEx(0, NULL, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
