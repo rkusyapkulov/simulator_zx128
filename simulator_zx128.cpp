@@ -2,6 +2,7 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <stdint.h>
 #include <mmsystem.h>
 #include <fstream>
 #include <vector>
@@ -121,26 +122,43 @@ static inline bool PopAudioEvent(AudioEvent& ev) {
 // --- СТРУКТУРА МУЗЫКАЛЬНОГО СОПРОЦЕССОРА AY-3-8910 ---
 struct AY38910 {
     enum StereoMode { MODE_MONO, MODE_ABC, MODE_ACB };
-    StereoMode stereo_mode = MODE_ABC; // По умолчанию популярный в СНГ режим ABC
+    StereoMode stereo_mode;
 
-    BYTE regs[16] = {};                 // Физические регистры чипа
-    BYTE selected_reg = 0;              // Индекс выбранного регистра
+    BYTE regs[16];
+    BYTE selected_reg;
 
-    double tone_phase[3] = { 0.0, 0.0, 0.0 }; // Фазы генераторов тона (каналы A, B, C)
-    double noise_phase = 0.0;           // Фаза генератора шума
-    double envelope_phase = 0.0;        // Фаза генератора огибающей
+    double tone_phase[3];
+    double noise_phase;
+    double envelope_phase;
 
-    unsigned int noise_lfsr = 1;        // Регистр сдвига для генерации шума (LFSR)
-    int envelope_level = 0;             // Текущий уровень громкости огибающей
-    int envelope_direction = -1;        // Направление изменения огибающей (1 или -1)
-    bool envelope_hold = false;         // Флаг удержания уровня огибающей
-    bool envelope_started = false;      // Флаг активности цикла огибающей
+    unsigned int noise_lfsr;
+    int envelope_level;
+    int envelope_direction;
+    bool envelope_hold;
+    bool envelope_started;
+
+    // Конструктор для инициализации полей (совместим с VS2010)
+    AY38910() {
+        stereo_mode = MODE_ABC;
+        selected_reg = 0;
+        
+        // Обнуление массивов
+        memset(regs, 0, sizeof(regs));
+        tone_phase[0] = tone_phase[1] = tone_phase[2] = 0.0;
+        
+        noise_phase = 0.0;
+        envelope_phase = 0.0;
+        noise_lfsr = 1;
+        envelope_level = 0;
+        envelope_direction = -1;
+        envelope_hold = false;
+        envelope_started = false;
+    }
 
     // Таблица соответствия уровней громкости AY (логарифмическая шкала)
-    static constexpr double VOLUME[16] = {
-        0.000, 0.011, 0.016, 0.023, 0.032, 0.045, 0.064, 0.090,
-        0.126, 0.178, 0.250, 0.354, 0.500, 0.630, 0.794, 1.000
-    };
+    // static-массивы тоже нельзя инициализировать внутри класса в старых стандартах. 
+    // Для VS2010 определение VOLUME нужно вынести за пределы структуры!
+    static const double VOLUME[16];
 
     void Reset() {
         EnterCriticalSection(&audio_cs);
@@ -179,6 +197,12 @@ struct AY38910 {
     }
 } ay;
 
+// Определение статического массива VOLUME (вынесите в .cpp файл или ниже структуры)
+const double AY38910::VOLUME[16] = {
+    0.000, 0.011, 0.016, 0.023, 0.032, 0.045, 0.064, 0.090,
+    0.126, 0.178, 0.250, 0.354, 0.500, 0.630, 0.794, 1.000
+};
+
 DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
     (void)lpParam;
 
@@ -198,8 +222,8 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
 
     uint64_t render_tstate = audio_cpu_tstates;
 
-    AudioEvent ev{};
-    AudioEvent pending{};
+    AudioEvent ev;
+    AudioEvent pending;
     bool has_pending = false;
 
     while (audio_thread_running) {
@@ -436,24 +460,24 @@ void ClearAudioBuffers() {
 }
 
 struct VG93 {
-    BYTE track_reg = 0;
-    BYTE sector_reg = 1;
-    BYTE data_reg = 0;
-    BYTE sector_buffer[256] = { 0 };
-    int  transfer_pos = -1;
-    int  transfer_len = 0;   // размер текущей передачи (256 для сектора, 6 для READ ADDRESS)
-    bool last_cmd_type1 = true;
-    bool multi_sector = false;    // бит m (0x10) команды READ/WRITE SECTOR — читать секторы подряд
-    bool record_not_found = false; // RNF: сектор/адрес не найден (диск не готов / вне диапазона)
-    BYTE system_reg = 0x00;
-    BYTE current_id_sector = 1;
-    bool step_direction_in = true;
+    BYTE track_reg;
+    BYTE sector_reg;
+    BYTE data_reg;
+    BYTE sector_buffer[256];
+    int  transfer_pos;
+    int  transfer_len;   // размер текущей передачи (256 для сектора, 6 для READ ADDRESS)
+    bool last_cmd_type1;
+    bool multi_sector;    // бит m (0x10) команды READ/WRITE SECTOR — читать секторы подряд
+    bool record_not_found; // RNF: сектор/адрес не найден (диск не готов / вне диапазона)
+    BYTE system_reg;
+    BYTE current_id_sector;
+    bool step_direction_in;
 
-    bool busy = false;
-    bool drq = false;
-    bool intrq = false;
-    bool     lost_data = false;   // бит 2 статуса Type II/III
-    uint64_t drq_since = 0;       // когда процессор последний раз обслуживал DRQ (T-states)
+    bool busy;
+    bool drq;
+    bool intrq;
+    bool     lost_data;   // бит 2 статуса Type II/III
+    uint64_t drq_since;       // когда процессор последний раз обслуживал DRQ (T-states)
 
     enum TransferType {
         TRANSFER_NONE,
@@ -463,7 +487,29 @@ struct VG93 {
         TRANSFER_WRITE_TRACK   // новое
     };
 
-    TransferType transfer_type = TRANSFER_NONE;
+    TransferType transfer_type;
+
+	VG93() {
+		track_reg = 0;
+		sector_reg = 1;
+		data_reg = 0;
+		memset(sector_buffer, 0, sizeof(sector_buffer));
+		transfer_pos = -1;
+		transfer_len = 0;   // размер текущей передачи (256 для сектора, 6 для READ ADDRESS)
+		last_cmd_type1 = true;
+		multi_sector = false;    // бит m (0x10) команды READ/WRITE SECTOR — читать секторы подряд
+		record_not_found = false; // RNF: сектор/адрес не найден (диск не готов / вне диапазона)
+		system_reg = 0x00;
+		current_id_sector = 1;
+		step_direction_in = true;
+
+		busy = false;
+		drq = false;
+		intrq = false;
+		lost_data = false;   // бит 2 статуса Type II/III
+		drq_since = 0;       // когда процессор последний раз обслуживал DRQ (T-states)
+		transfer_type = TRANSFER_NONE;
+    }
 
     void Reset() {
         // Полный сброс (включение питания / вставка диска) — сбрасывает
@@ -604,8 +650,8 @@ struct VG93 {
             // (GetTickCount64): дисковод 300 об/мин даёт период 200 мс =
             // 3 500 000 Гц * 0.2 с = 700000 T-states; импульс держим
             // активным первые ~5% периода (~10 мс), как и раньше.
-            constexpr uint64_t INDEX_PERIOD_TSTATES = 700000; // 200 мс при 3.5 МГц
-            constexpr uint64_t INDEX_PULSE_TSTATES = 35000;   // ~10 мс
+            uint64_t INDEX_PERIOD_TSTATES = 700000; // 200 мс при 3.5 МГц
+            uint64_t INDEX_PULSE_TSTATES = 35000;   // ~10 мс
             if ((audio_cpu_tstates % INDEX_PERIOD_TSTATES) < INDEX_PULSE_TSTATES)
                 status |= 0x02;
         }
@@ -1094,14 +1140,14 @@ struct CPUZ80 {
     WORD IX, IY;
     BYTE I, R;
     // IM0 support helper: byte placed on data bus by external device when IM=0
-    BYTE interrupt_vector_bus_byte = 0x00;
+    BYTE interrupt_vector_bus_byte;
 
     bool IFF1, IFF2; // Флаги разрешения прерываний Z80
     BYTE IM;         // Режим прерываний (0, 1 или 2)
     bool halted;
     bool int_pending;
-    int cycles_until_interrupt = CYCLES_PER_STEP;
-    int ei_delay_counter = 0; // counter to implement EI one-instruction delay (2 -> will enable after next step)
+    int cycles_until_interrupt;
+    int ei_delay_counter; // counter to implement EI one-instruction delay (2 -> will enable after next step)
 
     void Reset() {
         PC = 0x0000;
@@ -1123,6 +1169,7 @@ struct CPUZ80 {
         screen_shadow_page = false;
         memory_lock_128k = false;
         trdos_active = false;
+		interrupt_vector_bus_byte = 0x00;
     }
 
     // Вспомогательные сеттеры/геттеры регистровых пар
@@ -2912,9 +2959,9 @@ static bool LoadSclFile(
 
     const BYTE num_files = data[8];
 
-    constexpr size_t SCL_HEADER_SIZE = 9;
-    constexpr size_t SCL_FILE_HEADER = 14;
-    constexpr size_t SCL_CHECKSUM_SIZE = 4;
+    size_t SCL_HEADER_SIZE = 9;
+    size_t SCL_FILE_HEADER = 14;
+    size_t SCL_CHECKSUM_SIZE = 4;
 
     const size_t expected_headers_size =
         SCL_HEADER_SIZE +
@@ -2936,14 +2983,14 @@ static bool LoadSclFile(
     // 2. Создаем TRD
     // ============================================================
 
-    constexpr size_t TRD_SIZE = 655360;
-    constexpr size_t SECTOR_SIZE = 256;
-    constexpr size_t SECTORS_PER_TRACK = 16;
+    size_t TRD_SIZE = 655360;
+    size_t SECTOR_SIZE = 256;
+    size_t SECTORS_PER_TRACK = 16;
 
-    constexpr size_t TRD_TOTAL_SECTORS =
+    size_t TRD_TOTAL_SECTORS =
         TRD_SIZE / SECTOR_SIZE;       // 2560
 
-    constexpr size_t TRD_DATA_SECTORS =
+    size_t TRD_DATA_SECTORS =
         TRD_TOTAL_SECTORS - 16;       // 2544
 
     std::vector<BYTE> trd_image(
@@ -2957,7 +3004,7 @@ static bool LoadSclFile(
     // Offset = 8 * 256 = 2048
     // ============================================================
 
-    constexpr size_t sys_sector_offset =
+    size_t sys_sector_offset =
         8 * SECTOR_SIZE;
 
     // ВАЖНО:
@@ -3394,9 +3441,9 @@ void LoadSpectrumFile(HWND hwnd) {
     std::wstring ext = (dot == std::wstring::npos) ? L"" : path.substr(dot);
 
     // Переводим расширение в нижний регистр для безопасного сравнения
-    for (wchar_t& c : ext) {
-        c = (wchar_t)towlower(c);
-    }
+	for (size_t i = 0; i < ext.length(); ++i) {
+		ext[i] = (wchar_t)towlower(ext[i]);
+	}
 
     std::wstring error;
     bool ok = false;
@@ -3483,11 +3530,13 @@ static void PollPhysicalKeyboard(HWND hwnd) {
     };
 
     // 1. Опрос стандартных буквенно-цифровых клавиш
-    for (UINT vk : keys) {
-        int r, b;
-        if (MapVirtualKeyToSpectrum(vk, r, b))
-            SetPhysicalMatrixBit(r, b, (GetAsyncKeyState((int)vk) & 0x8000) != 0);
-    }
+	for (size_t i = 0; i < sizeof(keys); ++i) {
+		UINT vk = keys[i];
+		int r, b;
+		if (MapVirtualKeyToSpectrum(vk, r, b)) {
+			SetPhysicalMatrixBit(r, b, (GetAsyncKeyState((int)vk) & 0x8000) != 0);
+		}
+	}
 
     // 2. ОПРОС ФИЗИЧЕСКИХ СТРЕЛОК ПК КЛАВИАТУРЫ И КЛАВИШИ ВВОДА
     bool force_caps_shift = false;
